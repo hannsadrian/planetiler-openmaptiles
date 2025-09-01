@@ -1,4 +1,3 @@
-
 package org.openmaptiles.addons;
 
 import com.onthegomap.planetiler.FeatureCollector;
@@ -7,27 +6,19 @@ import com.onthegomap.planetiler.ForwardingProfile;
 import com.onthegomap.planetiler.VectorTile;
 import com.onthegomap.planetiler.reader.SourceFeature;
 import com.onthegomap.planetiler.reader.osm.OsmElement;
-import com.onthegomap.planetiler.reader.osm.OsmReader;
 import com.onthegomap.planetiler.reader.osm.OsmRelationInfo;
 import com.onthegomap.planetiler.util.MemoryEstimator;
+
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import org.openmaptiles.Layer;
-import org.openmaptiles.OpenMapTilesProfile;
-import org.openmaptiles.generated.Tables;
-import org.openmaptiles.util.Utils;
+import java.util.stream.Collectors;
 
 public class PublicTransport implements
   Layer,
   ForwardingProfile.OsmRelationPreprocessor,
-  Tables.OsmHighwayLinestring.Handler,
-  Tables.OsmRailwayLinestring.Handler,
-  Tables.OsmShipwayLinestring.Handler,
-  OpenMapTilesProfile.IgnoreWikidata,
+  ForwardingProfile.FeatureProcessor,
   ForwardingProfile.LayerPostProcessor {
-
 
   private static final String LAYER_NAME = "public_transport";
   private static final String ROUTE_ID_TAG = "__route_id";
@@ -37,97 +28,111 @@ public class PublicTransport implements
     return LAYER_NAME;
   }
 
+  // SCHRITT 1: Relationen vorverarbeiten, um jeden Way mit Routen-Infos zu "stempeln"
+  // Das war in Ihrem ersten Code schon goldrichtig.
   @Override
   public List<OsmRelationInfo> preprocessOsmRelation(OsmElement.Relation relation) {
-    if (relation.hasTag("route", "bus", "coach", "train", "tram", "subway", "ferry", "trolleybus", "monorail",
-      "light_rail")) {
-      String route = relation.getString("route");
-      String subclass = relation.getString("service");
-      if ("coach".equals(route)) {
-        subclass = "coach";
-      }
-      String ref = relation.getString("ref");
-      String network = relation.getString("network");
-      String operator = relation.getString("operator");
-      String colour = relation.getString("colour");
-      String name = relation.getString("name");
-      return List.of(new RouteRelation(route, subclass, ref, network, operator, colour, name, relation.id()));
+    if (relation.hasTag("route", "bus", "coach", "train", "tram", "subway", "ferry", "trolleybus", "monorail", "light_rail")) {
+      // Wir erstellen einen stabilen, eindeutigen Identifier für die Route
+      String routeId = String.join("|",
+        relation.getString("route"),
+        relation.getString("ref"),
+        relation.getString("network"),
+        relation.getString("operator"),
+        relation.getString("name")
+      );
+      return List.of(new RouteInfo(routeId, relation.id()));
     }
     return null;
   }
 
+  // SCHRITT 2: Features für jeden einzelnen Way erstellen, inklusive der brunnel/layer-Tags
   @Override
-  public void process(Tables.OsmHighwayLinestring element, FeatureCollector features) {
-    processWay(element.source(), features);
-  }
+  public void processFeature(SourceFeature feature, FeatureCollector features) {
+    // Wir interessieren uns nur für Linien (ways), die Teil unserer Routen-Relationen sind
+    if (feature.isLine()) {
+      List<RouteInfo> relations = feature.relationInfo(RouteInfo.class);
+      if (!relations.isEmpty()) {
+        for (var relationInfo : relations) {
+          OsmElement.Relation relation = feature.source().getRelation(relationInfo.relationId());
+          String routeType = relation.getString("route");
 
-  @Override
-  public void process(Tables.OsmRailwayLinestring element, FeatureCollector features) {
-    processWay(element.source(), features);
-  }
+          int minZoom = switch (routeType) {
+            case "ferry" -> 7;
+            case "train", "subway", "light_rail", "monorail" -> 8;
+            case "tram" -> 11;
+            default -> 12;
+          };
 
-  @Override
-  public void process(Tables.OsmShipwayLinestring element, FeatureCollector features) {
-    processWay(element.source(), features);
-  }
-
-  private void processWay(SourceFeature feature, FeatureCollector features) {
-    List<OsmReader.RelationMember<RouteRelation>> relations = feature.relationInfo(RouteRelation.class);
-    if (!relations.isEmpty()) {
-      for (var member : relations) {
-        RouteRelation relation = member.relation();
-        String routeId =
-          String.join("-", relation.route, relation.ref, relation.network, relation.operator, relation.name);
-        features.line(LAYER_NAME)
-          .setBufferPixels(30)
-          .setMinZoom(0)
-          .setMinPixelSize(0)
-          .setAttr(ROUTE_ID_TAG, routeId)
-          .setAttr("class", relation.route)
-          .setAttr("subclass", relation.subclass)
-          .setAttr("ref", relation.ref)
-          .setAttr("network", relation.network)
-          .setAttr("operator", relation.operator)
-          .setAttr("colour", relation.colour)
-          .setAttr("name", relation.name)
-          .setAttr("brunnel",
-            Utils.brunnel(feature.hasTag("bridge", "yes"), feature.hasTag("tunnel", "yes"),
-              feature.hasTag("ford", "yes")))
-          .setAttr("layer", feature.getLong("layer"));
+          features.line(LAYER_NAME)
+            .setBufferPixels(4) // Wichtig für saubere Übergänge
+            .setMinPixelSize(0) // Wir verwerfen erstmal nichts, das macht postProcess
+            .setZoomRange(minZoom, 14)
+            .setAttr(ROUTE_ID_TAG, relationInfo.routeId()) // Unser Merge-Schlüssel
+            // Die kritischen Attribute, die das Merging bisher verhindert haben:
+            .setAttr("brunnel", feature.getTag("brunnel"))
+            .setAttr("layer", feature.getTag("layer"))
+            // Die restlichen, für alle Segmente gleichen Attribute:
+            .setAttr("class", routeType)
+            .setAttr("ref", relation.getString("ref"))
+            .setAttr("network", relation.getString("network"))
+            .setAttr("operator", relation.getString("operator"))
+            .setAttr("colour", relation.getString("colour"))
+            .setAttr("name", relation.getString("name"));
+        }
       }
     }
   }
 
+  // SCHRITT 3: Die Magie - Ein smarter Post-Processing Schritt
   @Override
   public List<VectorTile.Feature> postProcess(int zoom, List<VectorTile.Feature> items) {
-    return FeatureMerge.mergeLineStrings(items,
-      0, // after merging, remove lines that are still less than 0.5px long
-      0.1, // simplify output linestrings using a 0.1px tolerance
-      8 // remove any detail more than 4px outside the tile boundary
-    );
+    // Gruppiere alle Segmente nach ihrer eindeutigen Routen-ID
+    Map<Object, List<VectorTile.Feature>> groupedByRoute = items.stream()
+      .collect(Collectors.groupingBy(f -> f.tags().get(ROUTE_ID_TAG)));
+
+    List<VectorTile.Feature> result = new ArrayList<>();
+
+    for (List<VectorTile.Feature> group : groupedByRoute.values()) {
+      // Für jede Gruppe (d.h. für jede einzelne Bus-/Bahnlinie)...
+      // ... entferne TEMPORÄR die Attribute, die das Zusammenfügen verhindern.
+      List<VectorTile.Feature> groupWithoutConflictingAttrs = new ArrayList<>();
+      for (VectorTile.Feature feature : group) {
+        // Erstelle eine Kopie der Tags OHNE brunnel und layer
+        var newTags = feature.tags().entrySet().stream()
+          .filter(e -> !e.getKey().equals("brunnel") && !e.getKey().equals("layer"))
+          .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+        // Erstelle ein neues Feature mit der gleichen Geometrie aber den "sauberen" Tags
+        groupWithoutConflictingAttrs.add(new VectorTile.Feature(
+          feature.layer(), feature.id(), feature.geometry(), newTags
+        ));
+      }
+
+      // Führe jetzt den Merge auf den "sauberen" Features durch.
+      // Da brunnel/layer weg sind, werden alle Teile einer Route zu einer Linie zusammengefügt.
+      List<VectorTile.Feature> merged = FeatureMerge.mergeLineStrings(groupWithoutConflictingAttrs,
+        0.5, // Mindestlänge in Pixeln
+        0.5, // Vereinfachungstoleranz
+        4,   // Puffer
+        ROUTE_ID_TAG
+      );
+
+      // ANMERKUNG: Durch diesen Prozess verlieren die zusammengefügten Linien die spezifischen
+      // brunnel/layer Tags. Die Linie ist jetzt durchgehend, aber man kann die Brücke nicht
+      // mehr separat stylen. Das ist der klassische Kompromiss: Kontinuität vs. Detail-Attribute.
+      // Für die meisten Anwendungsfälle ist eine durchgehende Linie wichtiger.
+      result.addAll(merged);
+    }
+
+    return result;
   }
 
-  record RouteRelation(
-    String route,
-    String subclass,
-    String ref,
-    String network,
-    String operator,
-    String colour,
-    String name,
-    @Override long id
-  ) implements OsmRelationInfo {
-
+  // Ein einfacher Record, um die Routen-ID zu speichern
+  record RouteInfo(String routeId, long relationId) implements OsmRelationInfo {
     @Override
     public long estimateMemoryUsageBytes() {
-      return MemoryEstimator.estimateSize(route) +
-        MemoryEstimator.estimateSize(subclass) +
-        MemoryEstimator.estimateSize(ref) +
-        MemoryEstimator.estimateSize(network) +
-        MemoryEstimator.estimateSize(operator) +
-        MemoryEstimator.estimateSize(colour) +
-        MemoryEstimator.estimateSize(name) +
-        Long.BYTES;
+      return MemoryEstimator.estimateSize(routeId) + Long.BYTES;
     }
   }
 }
